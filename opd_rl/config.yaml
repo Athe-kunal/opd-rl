@@ -1,0 +1,17 @@
+student_model: Open-Reasoner-Zero/Open-Reasoner-Zero-1.5B
+critic_model: Open-Reasoner-Zero/Open-Reasoner-Zero-Critic-1.5B
+teacher_model: Open-Reasoner-Zero/Open-Reasoner-Zero-7B
+
+dataset_name: open-r1/OpenR1-Math-220k
+dataset_config: default
+
+num_prompts: 20
+responses_per_prompt: 4
+max_new_tokens: 4096
+batch_size: 20
+seed: 0
+output_dir: opd_rl/data/orz_value_cache
+
+student_gpu: "2"
+teacher_gpu: "3"
+student_gpu_memory_fraction: 0.85
