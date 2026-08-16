@@ -14,8 +14,6 @@ from pathlib import Path
 
 import torch
 
-from opd_rl.kl_utils import per_token_kl
-
 
 def spearman(x: torch.Tensor, y: torch.Tensor) -> float:
   """Spearman rank correlation, as Pearson correlation of ranks."""
@@ -59,10 +57,9 @@ def compute_metrics(cache_dir: Path) -> dict[str, float]:
   for sample in load_samples(cache_dir):
     for resp in sample["responses"]:
       sample_dir = sample["_dir"]
-      student_probs = torch.load(sample_dir / resp["student_probs_path"])
-      teacher_probs = torch.load(sample_dir / resp["teacher_probs_path"])
       critic_values = torch.load(sample_dir / resp["critic_values_path"]).float()
-      forward_kl, reverse_kl = per_token_kl(student_probs, teacher_probs)
+      forward_kl = torch.load(sample_dir / resp["forward_kl_path"])
+      reverse_kl = torch.load(sample_dir / resp["reverse_kl_path"])
 
       all_critic.append(critic_values)
       all_forward_kl.append(forward_kl)

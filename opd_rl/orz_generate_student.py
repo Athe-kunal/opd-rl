@@ -1,17 +1,12 @@
-"""Persistent background server pinned to the student/critic GPU via
-CUDA_VISIBLE_DEVICES. Loads the ORZ student policy via vLLM for generation,
-plus transformers copies of the student (self-scoring) and critic
-(per-token value), all 1.5B so they share one GPU.
-
-Serves POST /run: generates any pending prompt, scores it, writes
-staging.json, and notifies --teacher-url so teacher scoring overlaps with
-the next batch. orz_teacher_force.py turns staging.json into meta.json.
+"""Persistent background server on the student/critic GPU. Serves POST /run,
+generating pending prompts and sending each to --teacher-url's POST /score.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 from pathlib import Path
 
@@ -30,53 +25,45 @@ from scoring import log_progress, score_response_text
 
 
 async def generate_one(engine: AsyncLLM, request_id: str, prompt: str, sampling_params: SamplingParams):
-  """Submits one request and returns its final (fully generated) output."""
   final_output = None
   async for output in engine.generate(prompt, sampling_params, request_id=request_id):
     final_output = output
   return final_output
 
 
-def save_staging_sample(output_dir: Path, index: int, problem: dict, request_output, state: dict) -> None:
-  sample_dir = output_dir / str(index)
-  sample_dir.mkdir(parents=True, exist_ok=True)
+def build_payload(problem: dict, request_output, state: dict) -> dict:
   prompt_text = render_prompt(problem["problem"])
-  staging = {"prompt": problem["problem"], "ground_truth_answer": problem["answer"], "responses": []}
-  for j, completion in enumerate(request_output.outputs):
+  responses = []
+  for completion in request_output.outputs:
     token_ids = list(completion.token_ids)
     student_probs = score_response_text(state["hf_model"], state["hf_tokenizer"], prompt_text, token_ids)
     critic_values = score_critic(state["critic_model"], state["critic_tokenizer"], prompt_text, token_ids)
-    student_probs_path = f"response_{j}_student_probs.pt"
-    critic_values_path = f"response_{j}_critic_values.pt"
-    torch.save(student_probs, sample_dir / student_probs_path)
-    torch.save(critic_values, sample_dir / critic_values_path)
-    staging["responses"].append({
+    responses.append({
         "response": completion.text,
         "stop_reason": str(completion.finish_reason),
         "num_tokens": len(token_ids),
         "token_ids": token_ids,
         "extracted_answer": extract_boxed_answer(completion.text),
         "reward": compute_reward(completion.text, problem["answer"]),
-        "student_probs_path": student_probs_path,
-        "critic_values_path": critic_values_path,
+        "critic_values": critic_values,
+        "student_probs": student_probs,
     })
-  (sample_dir / "staging.json").write_text(json.dumps(staging))
+  return {"prompt": problem["problem"], "ground_truth_answer": problem["answer"], "responses": responses}
+
+
+async def send_to_teacher(teacher_url: str, index: int, payload: dict) -> None:
+  buf = io.BytesIO()
+  torch.save(payload, buf)
+  async with aiohttp.ClientSession() as session:
+    async with session.post(
+        f"{teacher_url}/score", params={"index": index}, data=buf.getvalue(),
+        timeout=aiohttp.ClientTimeout(total=None),
+    ) as resp:
+      resp.raise_for_status()
 
 
 def pending_prompt_indices(output_dir: Path, prompts: list[dict]) -> list[int]:
-  return [
-      i for i in range(len(prompts))
-      if not (output_dir / str(i) / "staging.json").exists()
-      and not (output_dir / str(i) / "meta.json").exists()
-  ]
-
-
-async def notify_teacher(teacher_url: str) -> None:
-  try:
-    async with aiohttp.ClientSession() as session:
-      await session.post(f"{teacher_url}/run", timeout=aiohttp.ClientTimeout(total=None))
-  except Exception:
-    pass  # teacher's next explicit /run call will pick up whatever this missed
+  return [i for i in range(len(prompts)) if not (output_dir / str(i) / "meta.json").exists()]
 
 
 def make_app(args: argparse.Namespace) -> web.Application:
@@ -124,10 +111,6 @@ async def generate_pending(args: argparse.Namespace, state: dict) -> int:
       temperature=1.0,
       top_p=1.0,
       max_tokens=args.max_new_tokens,
-      # Default output_kind (CUMULATIVE) streams each of the n child
-      # completions as separate RequestOutputs; generate_one() only keeps
-      # the last one it sees, so without FINAL_ONLY we silently lose all
-      # but the last-finishing completion.
       output_kind=RequestOutputKind.FINAL_ONLY,
   )
 
@@ -141,15 +124,17 @@ async def generate_pending(args: argparse.Namespace, state: dict) -> int:
         for i, text in zip(batch_indices, texts)
     ))
 
-    def save_batch(idxs=batch_indices, outs=outputs):
-      for i, request_output in zip(idxs, outs):
-        save_staging_sample(args.output_dir, i, prompts[i], request_output, state)
-    await loop.run_in_executor(None, save_batch)
+    payloads = await loop.run_in_executor(
+        None, lambda: [build_payload(prompts[i], out, state) for i, out in zip(batch_indices, outputs)]
+    )
+    await asyncio.gather(*(
+        send_to_teacher(args.teacher_url, i, payload)
+        for i, payload in zip(batch_indices, payloads)
+    ))
 
     generated += len(batch_indices)
     done = len(prompts) - len(todo) + generated
-    log_progress(args.output_dir, f"[student] {done}/{len(prompts)} generated")
-    asyncio.create_task(notify_teacher(args.teacher_url))
+    log_progress(args.output_dir, f"[student] {done}/{len(prompts)} generated and scored")
 
   return generated
 

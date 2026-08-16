@@ -1,6 +1,6 @@
 """Streamlit app for inspecting orz_collect.py's cached rollouts: response
 text with tokens highlighted by critic value or student/teacher KL
-divergence, plus the underlying line charts and math_verify reward.
+divergence, plus math_verify reward.
 
 Run with: streamlit run opd_rl/orz_app.py -- --cache-dir opd_rl/data/orz_value_cache
 """
@@ -15,8 +15,6 @@ from pathlib import Path
 import streamlit as st
 import torch
 from transformers import AutoTokenizer
-
-from kl_utils import per_token_kl
 
 STUDENT_MODEL = "Open-Reasoner-Zero/Open-Reasoner-Zero-1.5B"
 
@@ -83,14 +81,11 @@ def render_sample(sample: dict, response_idx: int) -> None:
   resp = sample["responses"][response_idx]
   sample_dir = Path(sample["_dir"])
 
-  student_probs = torch.load(sample_dir / resp["student_probs_path"])
-  teacher_probs = torch.load(sample_dir / resp["teacher_probs_path"])
   critic_values = torch.load(sample_dir / resp["critic_values_path"]).float()
+  forward_kl = torch.load(sample_dir / resp["forward_kl_path"])
+  reverse_kl = torch.load(sample_dir / resp["reverse_kl_path"])
 
   st.metric("Reward (math_verify)", resp["reward"])
-
-  with st.spinner(f"Computing per-token KL over {student_probs.shape[0]} tokens..."):
-    forward_kl, reverse_kl = per_token_kl(student_probs, teacher_probs)
 
   metrics = {
       "critic value": critic_values,

@@ -1,7 +1,6 @@
 """Generates ORZ student rollouts on OpenR1-Math-220k problems, scores them
-with the ORZ critic (per-token value) and ORZ teacher (per-token full-vocab
-softmax, for KL divergence against the student), and caches everything for
-opd_rl/orz_app.py to visualize.
+with the ORZ critic (per-token value) and ORZ teacher (per-token KL against
+the student), and caches everything for opd_rl/orz_app.py to visualize.
 
 Run with: python -m opd_rl.orz_collect
 """
@@ -86,11 +85,8 @@ def main() -> None:
   wait_until_ready(f"{student_url}/health")
   wait_until_ready(f"{teacher_url}/health")
 
-  print("Generating (student pushes each finished batch to teacher as it goes)", flush=True)
+  print("Generating (student sends each prompt to teacher as it finishes)", flush=True)
   requests.post(f"{student_url}/run", timeout=None).raise_for_status()
-
-  print("Confirming teacher has scored everything student produced", flush=True)
-  requests.post(f"{teacher_url}/run", timeout=None).raise_for_status()
 
   print("Done. Servers are left running for the next job.", flush=True)
 

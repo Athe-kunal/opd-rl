@@ -1,16 +1,14 @@
-"""Run as a persistent background process, pinned to the teacher GPU via
-CUDA_VISIBLE_DEVICES.
-
-Loads the ORZ teacher (Open-Reasoner-Zero-7B) once via plain transformers,
-then serves POST /run: each call teacher-forces any sample that has
-staging.json but no meta.json yet, scoring against the ORZ plain-text prompt
-template (orz_common.render_prompt).
+"""Persistent background server on the teacher GPU. Serves POST /score,
+called by orz_generate_student.py once per prompt: computes the teacher's
+own distribution over the given token_ids, derives per-token KL against the
+student's distribution, and writes meta.json.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 from pathlib import Path
 
@@ -18,41 +16,43 @@ from aiohttp import web
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from kl_utils import per_token_kl
 from orz_common import render_prompt
 from scoring import log_progress, score_response_text
 
 
-def unscored_sample_dirs(cache_dir: Path) -> list[Path]:
-  return sorted(
-      (p for p in cache_dir.iterdir()
-       if p.is_dir() and (p / "staging.json").exists() and not (p / "meta.json").exists()),
-      key=lambda p: int(p.name),
-  )
+def score_sample(model, tokenizer, output_dir: Path, index: int, payload: dict) -> None:
+  sample_dir = output_dir / str(index)
+  sample_dir.mkdir(parents=True, exist_ok=True)
+  prompt_text = render_prompt(payload["prompt"])
 
+  meta = {"prompt": payload["prompt"], "ground_truth_answer": payload["ground_truth_answer"], "responses": []}
+  for j, resp in enumerate(payload["responses"]):
+    teacher_probs = score_response_text(model, tokenizer, prompt_text, resp["token_ids"])
+    forward_kl, reverse_kl = per_token_kl(resp["student_probs"], teacher_probs)
 
-def score_pending(model, tokenizer, cache_dir: Path) -> int:
-  pending = unscored_sample_dirs(cache_dir)
-  if not pending:
-    return 0
+    critic_values_path = f"response_{j}_critic_values.pt"
+    forward_kl_path = f"response_{j}_forward_kl.pt"
+    reverse_kl_path = f"response_{j}_reverse_kl.pt"
+    torch.save(resp["critic_values"], sample_dir / critic_values_path)
+    torch.save(forward_kl, sample_dir / forward_kl_path)
+    torch.save(reverse_kl, sample_dir / reverse_kl_path)
 
-  total = len(json.loads((cache_dir / "prompts.json").read_text()))
-  scored = 0
-  for sample_dir in pending:
-    staging = json.loads((sample_dir / "staging.json").read_text())
-    prompt_text = render_prompt(staging["prompt"])
-    for j, resp in enumerate(staging["responses"]):
-      probs = score_response_text(model, tokenizer, prompt_text, resp["token_ids"])
-      probs_path = f"response_{j}_teacher_probs.pt"
-      torch.save(probs, sample_dir / probs_path)
-      resp["teacher_probs_path"] = probs_path
-    tmp_path = sample_dir / "meta.json.tmp"
-    tmp_path.write_text(json.dumps(staging))
-    tmp_path.rename(sample_dir / "meta.json")
-    scored += 1
-    done = sum(1 for p in cache_dir.iterdir() if p.is_dir() and (p / "meta.json").exists())
-    log_progress(cache_dir, f"[teacher] {done}/{total} scored")
+    meta["responses"].append({
+        "response": resp["response"],
+        "stop_reason": resp["stop_reason"],
+        "num_tokens": resp["num_tokens"],
+        "token_ids": resp["token_ids"],
+        "extracted_answer": resp["extracted_answer"],
+        "reward": resp["reward"],
+        "critic_values_path": critic_values_path,
+        "forward_kl_path": forward_kl_path,
+        "reverse_kl_path": reverse_kl_path,
+    })
 
-  return scored
+  tmp_path = sample_dir / "meta.json.tmp"
+  tmp_path.write_text(json.dumps(meta))
+  tmp_path.rename(sample_dir / "meta.json")
 
 
 def make_app(args: argparse.Namespace) -> web.Application:
@@ -64,20 +64,29 @@ def make_app(args: argparse.Namespace) -> web.Application:
         args.model, dtype=torch.bfloat16, device_map="cuda"
     ).eval()
     state["lock"] = asyncio.Lock()
+    state["scored"] = 0
+    state["total"] = len(json.loads((args.cache_dir / "prompts.json").read_text()))
 
-  async def handle_run(request: web.Request) -> web.Response:
+  async def handle_score(request: web.Request) -> web.Response:
+    index = int(request.query["index"])
+    body = await request.read()
+    payload = torch.load(io.BytesIO(body), weights_only=False)
+
     async with state["lock"]:
       loop = asyncio.get_running_loop()
-      scored = await loop.run_in_executor(
-          None, score_pending, state["model"], state["tokenizer"], args.cache_dir
+      await loop.run_in_executor(
+          None, score_sample, state["model"], state["tokenizer"], args.cache_dir, index, payload
       )
-    return web.json_response({"scored": scored})
+      state["scored"] += 1
+      log_progress(args.cache_dir, f"[teacher] {state['scored']}/{state['total']} scored")
+
+    return web.json_response({"status": "ok"})
 
   async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
-  app = web.Application()
-  app.router.add_post("/run", handle_run)
+  app = web.Application(client_max_size=0)
+  app.router.add_post("/score", handle_score)
   app.router.add_get("/health", handle_health)
   app.on_startup.append(on_startup)
   return app
